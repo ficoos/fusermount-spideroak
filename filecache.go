@@ -137,7 +137,14 @@ func (fc *FileCache) GetFile(entry FileEntry, url string) ReadAtCloser {
 	for {
 		// Check if we already have the file cached
 		if f, err := os.Open(localPath); err == nil {
-			return f
+			stat, err := f.Stat()
+			if err != nil || uint64(stat.Size()) == entry.Size {
+				return f
+			} else {
+				if err := f.Close(); err != nil {
+					panic(err)
+				}
+			}
 		}
 
 		if sf, ok := fc.activeDownloads[url]; ok {
