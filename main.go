@@ -25,6 +25,8 @@ var cacheSize uint64 = 0
 var cacheDir = flag.String("cache-dir", ".cache", "cache directory")
 var help bool = false
 
+const DIR_INFO_CACHE_DURAITON = 10 * time.Minute
+
 func init() {
 	flag.Var(&SizeVar{&cacheSize}, "cache-size", "size of the cache (default 1G)")
 	flag.BoolVar(&help, "h", false, "display this help and exit")
@@ -164,11 +166,16 @@ func (sf *ShareFile) Allocate(off uint64, size uint64, mode uint32) (code fuse.S
 	return fuse.EBADF
 }
 
+type CachedDirInfo struct {
+	Info      *DirInfo
+	ExpiresAt time.Time
+}
+
 type ShareFs struct {
 	pathfs.FileSystem
 	share       SpiderOakShare
 	dirCacheMtx sync.Mutex
-	dirCache    map[string]*DirInfo
+	dirCache    map[string]CachedDirInfo
 	fileCache   *FileCache
 }
 
@@ -180,7 +187,7 @@ func New(shareID string, roomKey string, cacheDir string, cacheSize uint64) path
 	return &ShareFs{
 		FileSystem: pathfs.NewDefaultFileSystem(),
 		share:      NewSpiderOakShare(shareID, roomKey),
-		dirCache:   make(map[string]*DirInfo),
+		dirCache:   make(map[string]CachedDirInfo),
 		fileCache:  fc,
 	}
 }
@@ -291,8 +298,12 @@ func (fs *ShareFs) getDirInfo(name string) (*DirInfo, fuse.Status) {
 
 	// we need to expire the dir cache
 	if res, ok := fs.dirCache[name]; ok {
-		fs.dirCacheMtx.Unlock()
-		return res, fuse.OK
+		if res.ExpiresAt.After(time.Now()) {
+			fs.dirCacheMtx.Unlock()
+			return res.Info, fuse.OK
+		}
+
+		delete(fs.dirCache, name)
 	}
 
 	fs.dirCacheMtx.Unlock()
@@ -303,7 +314,7 @@ func (fs *ShareFs) getDirInfo(name string) (*DirInfo, fuse.Status) {
 	}
 
 	fs.dirCacheMtx.Lock()
-	fs.dirCache[name] = di
+	fs.dirCache[name] = CachedDirInfo{di, time.Now().Add(DIR_INFO_CACHE_DURAITON)}
 	fs.dirCacheMtx.Unlock()
 
 	return di, fuse.OK
