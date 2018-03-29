@@ -24,3 +24,5 @@ Usage of fusermount-spideroak: -share-id <SHAREID> -room-key <ROOMKEY> [option].
   **A:** Cache size is a recommendation more than a hard limit.
   Files are not actually cleared until they are closed.
   As a rule of thumb the actual cache size should not exceed cache-size + biggest file accessed + all open files.
+* **Q:** I update things on the share but I don't see an update until I remount
+  **A:** The current cache implementation assumes the share never changes. We do intend to fix that.

@@ -289,6 +289,7 @@ func (fs *ShareFs) getDirInfo(name string) (*DirInfo, fuse.Status) {
 	name = path.Clean(name)
 	fs.dirCacheMtx.Lock()
 
+	// we need to expire the dir cache
 	if res, ok := fs.dirCache[name]; ok {
 		fs.dirCacheMtx.Unlock()
 		return res, fuse.OK
