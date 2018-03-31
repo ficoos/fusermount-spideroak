@@ -205,6 +205,9 @@ func (sf *StreamingFile) stream() {
 	for {
 		resp, err := http.Get(sf.url)
 		sf.bytesWritten = 0
+		if _, err := sf.backingFile.Seek(0, os.SEEK_SET); err != nil {
+			panic(err)
+		}
 		if err != nil || resp.StatusCode != http.StatusOK {
 			log.Printf("Failed to get '%s'", sf.url)
 			continue
