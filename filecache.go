@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
@@ -15,7 +16,7 @@ import (
 	"sync/atomic"
 )
 
-const STREAM_CHUNK_SIZE = 4096
+const STREAM_CHUNK_SIZE = 4096 * 4
 
 type HttpError struct {
 	Status     string
@@ -164,12 +165,109 @@ func (fc *FileCache) GetFile(entry FileEntry, url string) ReadAtCloser {
 	}
 }
 
+type BitMap []uint64
+
+const BM_ITEM_SIZE = 64
+
+func NewBitMap(size uint) BitMap {
+	arraySize := (size + BM_ITEM_SIZE - 1) / BM_ITEM_SIZE
+	bm := make([]uint64, arraySize)
+	// mark the excess bits as set
+	var mask uint64 = ^((1 << (size % BM_ITEM_SIZE)) - 1)
+	bm[arraySize-1] = mask
+
+	return bm
+}
+
+func (bm BitMap) Set(offset uint) {
+	[]uint64(bm)[offset/BM_ITEM_SIZE] |= 1 << (offset % BM_ITEM_SIZE)
+}
+
+func (bm BitMap) Unset(offset uint) {
+	[]uint64(bm)[offset/BM_ITEM_SIZE] &= ^(1 << (offset % BM_ITEM_SIZE))
+}
+
+func (bm BitMap) Get(offset uint) bool {
+	return []uint64(bm)[offset/BM_ITEM_SIZE]&(1<<(offset%BM_ITEM_SIZE)) != 0
+}
+
+func (bm BitMap) Len() int {
+	return len(bm) * BM_ITEM_SIZE
+}
+
+func (bn BitMap) FirstUnsetFrom(offset uint) int {
+	for i := int(offset); i < len(bn); i++ {
+		if bn[i] == 0xffffffff {
+			continue
+		}
+
+		cell := bn[i]
+		for j := 0; j < BM_ITEM_SIZE; j++ {
+			if cell&1 != 1 {
+				return i*BM_ITEM_SIZE + j
+			} else {
+				cell >>= 1
+			}
+		}
+	}
+
+	return -1
+}
+
+func (bn BitMap) Debug() string {
+	var res bytes.Buffer
+	for i := 0; i < len(bn); i++ {
+		for j := uint(0); j < BM_ITEM_SIZE/4; j++ {
+			b := ([]uint64(bn)[i] >> (j * 4)) & 0x0f
+			switch b {
+			case 0:
+				res.WriteString(" ")
+			case 1:
+				res.WriteString("\u2596")
+			case 2:
+				res.WriteString("\u2597")
+			case 3:
+				res.WriteString("\u2584")
+			case 4:
+				res.WriteString("\u2598")
+			case 5:
+				res.WriteString("\u258C")
+			case 6:
+				res.WriteString("\u259A")
+			case 7:
+				res.WriteString("\u2599")
+			case 8:
+				res.WriteString("\u259D")
+			case 9:
+				res.WriteString("\u259E")
+			case 10:
+				res.WriteString("\u2590")
+			case 11:
+				res.WriteString("\u259F")
+			case 12:
+				res.WriteString("\u2580")
+			case 13:
+				res.WriteString("\u259B")
+			case 14:
+				res.WriteString("\u259C")
+			case 15:
+				res.WriteString("\u2588")
+			}
+		}
+	}
+
+	return res.String()
+}
+
+func (bn BitMap) FirstUnset() int {
+	return bn.FirstUnsetFrom(0)
+}
+
 type StreamingFile struct {
 	url            string
 	localPath      string
-	response       *http.Response
 	backingFile    *os.File
-	bytesWritten   uint64
+	bitmap         BitMap
 	fileSize       uint64
 	refCount       int64
 	bytesWriteCond *sync.Cond
@@ -177,7 +275,6 @@ type StreamingFile struct {
 
 func NewStreamingFile(localPath string, url string, fileSize uint64) *StreamingFile {
 	tmpFile := localPath + ".part"
-
 	backingFile, err := os.Create(tmpFile)
 	if err != nil {
 		panic(err)
@@ -186,31 +283,87 @@ func NewStreamingFile(localPath string, url string, fileSize uint64) *StreamingF
 	f := &StreamingFile{
 		url:            url,
 		localPath:      localPath,
-		response:       nil,
 		backingFile:    backingFile,
 		fileSize:       fileSize,
-		bytesWritten:   0,
-		refCount:       2, // 1 for the download thread and one for the return value
+		bitmap:         NewBitMap(uint((fileSize + STREAM_CHUNK_SIZE - 1) / STREAM_CHUNK_SIZE)),
+		refCount:       2, // the first is the returned file the seconds is the completion waiting goroutine
 		bytesWriteCond: sync.NewCond(&sync.Mutex{}),
 	}
 
-	go f.stream()
+	if fileSize < STREAM_CHUNK_SIZE {
+		go f.download(0)
+	} else {
+		tailPart := STREAM_CHUNK_SIZE + (fileSize % STREAM_CHUNK_SIZE)
+		go f.download(0)
+		go f.download(uint(fileSize - tailPart))
+	}
+	go func() {
+		f.bytesWriteCond.L.Lock()
+		defer f.bytesWriteCond.L.Unlock()
+		for f.bitmap.FirstUnset() != -1 {
+			f.bytesWriteCond.Wait()
+		}
+
+		if f.bitmap.FirstUnset() == -1 {
+			if err := os.Rename(f.localPath+".part", f.localPath); err != nil {
+				panic(err)
+			}
+			if err := f.Close(); err != nil {
+				panic(err)
+			}
+
+			log.Printf("Finished downloading '%s'", f.url)
+		}
+	}()
 
 	return f
 }
 
-func (sf *StreamingFile) stream() {
-	log.Printf("Downloading '%s'", sf.url)
-	buff := make([]byte, STREAM_CHUNK_SIZE)
-	for {
-		resp, err := http.Get(sf.url)
-		sf.bytesWritten = 0
-		if _, err := sf.backingFile.Seek(0, os.SEEK_SET); err != nil {
+func (sf *StreamingFile) markChunkComplete(chunk uint) {
+	sf.bytesWriteCond.L.Lock()
+	sf.bitmap.Set(chunk)
+	sf.bytesWriteCond.Broadcast()
+	sf.bytesWriteCond.L.Unlock()
+}
+
+func (sf *StreamingFile) download(fromOffset uint) {
+	if !sf.IncRef() {
+		panic("Download requested after file finished downloading")
+	}
+	defer func() {
+		if err := sf.Close(); err != nil {
 			panic(err)
 		}
-		if err != nil || resp.StatusCode != http.StatusOK {
-			log.Printf("Failed to get '%s'", sf.url)
+	}()
+
+	buff := make([]byte, STREAM_CHUNK_SIZE)
+	currentChunk := fromOffset / STREAM_CHUNK_SIZE
+	client := &http.Client{}
+	bytesWritten := uint(0)
+	for {
+		if currentChunk == uint(sf.bitmap.Len()) || sf.bitmap.Get(currentChunk) {
+			return
+		}
+		log.Printf("Downloading '%s+%d'", sf.url, fromOffset)
+		request, err := http.NewRequest(http.MethodGet, sf.url, nil)
+		if err != nil {
+			panic(err)
+		}
+
+		request.Header.Add("Range", fmt.Sprintf("bytes=%d-", currentChunk*STREAM_CHUNK_SIZE+bytesWritten))
+		resp, err := client.Do(request)
+		if err != nil {
+			log.Printf("Failed to get '%s': %s (%d)", sf.url, resp.Status, resp.StatusCode)
 			continue
+		}
+
+		switch resp.StatusCode {
+		case http.StatusOK, http.StatusPartialContent:
+			break
+		case http.StatusRequestedRangeNotSatisfiable:
+			panic(fmt.Sprintf("Got requested range not satisfiable for range %d", currentChunk*STREAM_CHUNK_SIZE))
+		default:
+			log.Printf("Failed to get '%s': %s (%d)", sf.url, resp.Status, resp.StatusCode)
 		}
 
 		for {
@@ -220,24 +373,22 @@ func (sf *StreamingFile) stream() {
 				break
 			}
 
-			if _, err := sf.backingFile.Write(buff[:nread]); err != nil {
+			if _, err := sf.backingFile.WriteAt(buff[:nread], int64(currentChunk*STREAM_CHUNK_SIZE+uint(bytesWritten))); err != nil {
 				panic(err)
 			}
 
-			sf.bytesWriteCond.L.Lock()
-			sf.bytesWritten += uint64(nread)
-			sf.bytesWriteCond.Broadcast()
-			sf.bytesWriteCond.L.Unlock()
-			if err == io.EOF {
-				if err := os.Rename(sf.localPath+".part", sf.localPath); err != nil {
-					panic(err)
+			bytesWritten += uint(nread)
+			for bytesWritten >= STREAM_CHUNK_SIZE {
+				bytesWritten -= STREAM_CHUNK_SIZE
+				sf.markChunkComplete(currentChunk)
+				currentChunk++
+				if currentChunk == uint(sf.bitmap.Len()) || sf.bitmap.Get(currentChunk) {
+					return
 				}
+			}
 
-				if err := sf.Close(); err != nil {
-					panic(err)
-				}
-
-				log.Printf("Finished downloading '%s'", sf.url)
+			if uint64(currentChunk*STREAM_CHUNK_SIZE+bytesWritten) >= sf.fileSize {
+				sf.markChunkComplete(currentChunk)
 				return
 			}
 		}
@@ -261,8 +412,11 @@ func (sf *StreamingFile) IncRef() bool {
 
 func (sf *StreamingFile) ReadAt(p []byte, off int64) (int, error) {
 	sf.bytesWriteCond.L.Lock()
-	for sf.bytesWritten < uint64(off+int64(len(p))) && sf.bytesWritten < sf.fileSize {
-		sf.bytesWriteCond.Wait()
+	for i := 0; i < (len(p)+STREAM_CHUNK_SIZE-1)/STREAM_CHUNK_SIZE; i++ {
+		requiredChunk := uint(off/STREAM_CHUNK_SIZE + int64(i))
+		for !sf.bitmap.Get(requiredChunk) {
+			sf.bytesWriteCond.Wait()
+		}
 	}
 	sf.bytesWriteCond.L.Unlock()
 
@@ -270,12 +424,9 @@ func (sf *StreamingFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (sf *StreamingFile) Close() error {
-	v := atomic.AddInt64(&sf.refCount, -1)
-	if v == 0 {
+	if atomic.AddInt64(&sf.refCount, -1) == 0 {
 		if err := sf.backingFile.Close(); err != nil {
 			panic(err)
-		} else {
-			return nil
 		}
 	}
 
